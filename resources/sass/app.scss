@@ -1,0 +1,22 @@
+// Font Awesome
+@import '@fortawesome/fontawesome-free/css/all.min.css';
+
+// Bootstrap
+@import 'bootstrap/scss/bootstrap';
+
+// Custom styles
+body {
+    background-color: #f8fafc;
+}
+
+.bg-gradient {
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+}
+
+.card-hover {
+    transition: all 0.3s ease;
+    &:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+    }
+}
