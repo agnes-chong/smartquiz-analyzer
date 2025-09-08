@@ -1,7 +1,37 @@
-// Body
-$body-bg: #f8fafc;
+// 🎨 Colors from Zuru styleguide
+$white: #ffffff;
+$black: #000000;
+$dark: #111111;
 
-// Typography
-$font-family-sans-serif: 'Nunito', sans-serif;
-$font-size-base: 0.9rem;
+$primary: #28a745;   // Green (main brand)
+$secondary: #6c757d; // Grey
+$danger: #dc3545;    // Red
+$warning: #ffc107;   // Yellow
+$info: #17a2b8;      // Subtle Blue/Info
+$success: #28a745;   // Subtle Green
+$bronze: #cd7f32;
+
+// Bootstrap override colors
+$theme-colors: (
+  "primary": $primary,
+  "secondary": $secondary,
+  "danger": $danger,
+  "warning": $warning,
+  "success": $success,
+  "info": $info,
+  "dark": $dark,
+);
+
+// ✍️ Typography (Ubuntu family from styleguide)
+$font-family-sans-serif: 'Ubuntu', sans-serif;
+$headings-font-weight: 700;
+$headings-font-family: 'Ubuntu', sans-serif;
+$body-font-family: 'Ubuntu', sans-serif;
+
+$font-size-base: 0.95rem;
 $line-height-base: 1.6;
+
+// Spacing & radius
+$border-radius: 0.5rem;
+$btn-padding-y: 0.6rem;
+$btn-padding-x: 1.25rem;

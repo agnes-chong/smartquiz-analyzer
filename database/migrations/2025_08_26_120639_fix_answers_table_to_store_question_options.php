@@ -13,50 +13,32 @@ return new class extends Migration
      */
     public function up()
     {
-        Schema::table('answers', function (Blueprint $table) {
-            // If these columns exist, drop them (table is empty so it's safe)
+                Schema::table('answers', function (Blueprint $t) {
+            // ✅ Drops the foreign key AND the column in one call (if it exists)
             if (Schema::hasColumn('answers', 'attempt_id')) {
-                $table->dropColumn('attempt_id');
-            }
-            if (Schema::hasColumn('answers', 'response')) {
-                $table->dropColumn('response');
+                $t->dropConstrainedForeignId('attempt_id');
             }
 
-            // Add the option text column if missing
-            if (!Schema::hasColumn('answers', 'text')) {
-                $table->string('text');
-            }
-
-            // Ensure FK to questions is correct type & constraint
-            // (If your questions.id is BIGINT auto-increment, this is fine)
-            // If questions.id is UUID, tell me and we’ll adjust.
+            // Ensure answers keep the right columns for question options
             if (!Schema::hasColumn('answers', 'question_id')) {
-                $table->foreignId('question_id')->constrained()->cascadeOnDelete();
-            } else {
-                // (Optional) add FK if not present
-                // You may need to drop an existing foreign key first if it differs.
-                // $table->foreign('question_id')->references('id')->on('questions')->cascadeOnDelete();
+                $t->foreignId('question_id')->constrained('questions')->cascadeOnDelete();
             }
-
-            // Make sure is_correct exists (boolean)
+            if (!Schema::hasColumn('answers', 'text')) {
+                $t->string('text');
+            }
             if (!Schema::hasColumn('answers', 'is_correct')) {
-                $table->boolean('is_correct')->default(false);
+                $t->boolean('is_correct')->default(false);
             }
         });
     }
 
     public function down(): void
     {
-        Schema::table('answers', function (Blueprint $table) {
-            // revert if you want (optional)
-            if (Schema::hasColumn('answers', 'text')) {
-                $table->dropColumn('text');
-            }
-            if (!Schema::hasColumn('answers', 'response')) {
-                $table->text('response')->nullable();
-            }
+        Schema::table('answers', function (Blueprint $t) {
+            // If you ever rollback, you can re-add attempt_id (optional)
             if (!Schema::hasColumn('answers', 'attempt_id')) {
-                $table->unsignedBigInteger('attempt_id')->nullable();
+                $t->foreignId('attempt_id')->nullable()
+                  ->constrained('quiz_attempts')->nullOnDelete();
             }
         });
     }

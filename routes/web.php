@@ -18,7 +18,7 @@ use App\Http\Controllers\AuditLogController;
 */
 
 // Public landing page (your pastel homepage)
-Route::view('/', 'home')->name('landing');
+Route::view('/', 'home')->name('home');
 
 // Laravel auth routes (login, register, password reset, etc.)
 Auth::routes([

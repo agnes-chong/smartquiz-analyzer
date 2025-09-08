@@ -7,14 +7,16 @@
     "devDependencies": {
         "@popperjs/core": "^2.11.8",
         "axios": "^1.1.2",
-        "bootstrap": "^5.3.7",
-        "laravel-vite-plugin": "^0.7.2",
+        "bootstrap": "^5.3.8",
+        "laravel-vite-plugin": "^0.7.8",
         "lodash": "^4.17.19",
         "postcss": "^8.1.14",
-        "sass": "^1.89.2",
-        "vite": "^4.0.0"
+        "sass": "^1.62.1",
+        "vite": "^4.5.14"
     },
     "dependencies": {
+        "@fontsource/nunito": "^5.2.6",
+        "@fontsource/poppins": "^5.2.6",
         "@fortawesome/fontawesome-free": "^7.0.0"
     }
 }

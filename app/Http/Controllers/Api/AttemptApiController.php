@@ -6,26 +6,51 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
-use JsonException;
 
 use App\Models\Quiz;
+use App\Models\Question;
 use App\Models\QuizAttempt;
 use App\Models\AttemptAnswer;
 
+use App\Contracts\ScoringStrategy;
+use App\Strategies\Scoring\ExactMatchStrategy;
+use App\Strategies\Scoring\PartialCreditStrategy;
+use App\Strategies\Scoring\NegativeMarkingStrategy;
+
 class AttemptApiController extends Controller
 {
+    /** Choose Strategy by question->scoring (single-pattern: Strategy) */
+    private function pickStrategy(Question $q): ScoringStrategy
+    {
+        return match ($q->scoring) {
+            'partial'  => app(PartialCreditStrategy::class),
+            'negative' => app(NegativeMarkingStrategy::class),
+            default    => app(ExactMatchStrategy::class),
+        };
+    }
+
     /**
      * Start a new attempt (student)
+     * POST /api/v1/quizzes/{quiz}/attempt(s)
      */
     public function store(Request $request, int $quizId)
     {
         $quiz = Quiz::findOrFail($quizId);
+
+        // 🔒 enforce availability window
+        $now = now();
+        if (!$quiz->is_active ||
+            ($quiz->starts_at && $now->lt($quiz->starts_at)) ||
+            ($quiz->ends_at && $now->gt($quiz->ends_at))) {
+            return response()->json(['message' => 'Quiz is not open'], 422);
+        }
 
         $attempt = QuizAttempt::create([
             'quiz_id' => $quiz->id,
             'student_id' => $request->user()->id,
             'score' => 0,
             'detail' => null,
+            'started_at' => now(),
             'completed_at' => null,
         ]);
 
@@ -34,7 +59,7 @@ class AttemptApiController extends Controller
 
     /**
      * Submit/finish an attempt (owner only).
-     * Route-model binding passes the QuizAttempt.
+     * POST /api/v1/attempts/{attempt}/finish
      */
     public function finish(Request $request, QuizAttempt $attempt)
     {
@@ -48,6 +73,16 @@ class AttemptApiController extends Controller
             ]);
         }
 
+        $quiz = Quiz::with(['questions.answers'])->findOrFail($attempt->quiz_id);
+
+        // ⏱️ duration guard
+        if ($attempt->started_at && $quiz->duration_minutes) {
+            $elapsed = $attempt->started_at->diffInMinutes(now());
+            if ($elapsed > $quiz->duration_minutes) {
+                return response()->json(['message' => 'Time is up'], 422);
+            }
+        }
+
         // Decode "responses"
         $raw = $request->input('responses');
         if ($raw === null) {
@@ -55,229 +90,164 @@ class AttemptApiController extends Controller
                 'responses' => ['The responses field is required.'],
             ]);
         }
-
         if (is_string($raw)) {
-            try {
-                $responses = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
-            } catch (JsonException $e) {
-                throw ValidationException::withMessages([
-                    'responses' => ['Invalid JSON in responses: ' . $e->getMessage()],
-                ]);
-            }
+            $responses = json_decode($raw, true);
         } elseif (is_array($raw)) {
             $responses = $raw;
         } else {
+            $responses = null;
+        }
+        if (!is_array($responses)) {
             throw ValidationException::withMessages([
                 'responses' => ['Responses must be an object/array.'],
             ]);
         }
 
-        $quiz = Quiz::with(['questions.answers'])->findOrFail($attempt->quiz_id);
         $questions = $quiz->questions;
-
         $detail = [
-            'quiz_id' => $quiz->id,
-            'items' => [],
-            'total' => $questions->count(),
-            'correct' => 0,
-            'incorrect' => 0,
-            'skipped' => 0,
-            'marks_total' => 0.0,
+            'quiz_id'      => $quiz->id,
+            'items'        => [],
+            'total'        => $questions->count(),
+            'correct'      => 0,
+            'incorrect'    => 0,
+            'skipped'      => 0,
+            'marks_total'  => 0.0,
         ];
+        $scoreCorrect = 0;
 
-        $scoreCorrectQuestions = 0;
-
-        DB::transaction(function () use ($attempt, $questions, $responses, &$detail, &$scoreCorrectQuestions) {
+        DB::transaction(function () use ($attempt, $questions, $responses, &$detail, &$scoreCorrect) {
 
             foreach ($questions as $q) {
                 $qid = (string) $q->id;
                 $given = $responses[$qid] ?? null;
                 $qMarks = (float) ($q->marks ?? 1.0);
 
-                // Normalize "given" into array-of-ids for MCQ/multi; string for short
+                // Normalize for arrays (MCQ/TF)
                 $givenIds = is_array($given) ? array_map('strval', $given)
                     : ((is_null($given) || $given === '') ? [] : [(string) $given]);
 
-                /**
-                 * SHORT ANSWER
-                 */
-                if (($q->type ?? '') === 'short') {
+                /* -------- SHORT (manual) → pending -------- */
+                if ($q->type === 'short' && ($q->scoring ?? 'manual') === 'manual') {
                     $text = is_string($given) ? trim($given) : null;
-                    $isManual = (($q->scoring ?? 'auto') === 'manual');
-
-                    if ($isManual) {
-                        // Save as pending for manual marking
-                        AttemptAnswer::create([
-                            'attempt_id' => $attempt->id,
-                            'question_id' => $q->id,
-                            'answer_id' => null,
-                            'response_text' => $text,
-                            'is_correct' => 0,             // use 0 if column NOT NULL
-                            'awarded_marks' => 0,
-                            'marking_method' => 'manual',
-                        ]);
-
-                        $detail['items'][] = [
-                            'question_id' => $q->id,
-                            'given_answer' => $text,
-                            'correct_answers' => [],
-                            'is_correct' => false,
-                            'status' => 'pending',
-                            'awarded_marks' => 0,
-                        ];
-
-                        // Track as pending; we count it in "skipped" bucket for now
-                        $detail['skipped']++;
-                        continue;
-                    }
-
-                    // Auto-graded short
-                    $canonical = collect((array) ($q->answer ?? []))
-                        ->map(fn($s) => is_string($s) ? mb_strtolower(trim($s)) : '')
-                        ->filter()->values()->all();
-
-                    $isCorrect = $text !== null && in_array(mb_strtolower($text), $canonical, true);
-                    $awarded = $isCorrect ? $qMarks : 0.0;
 
                     AttemptAnswer::create([
-                        'attempt_id' => $attempt->id,
-                        'question_id' => $q->id,
-                        'answer_id' => null,
-                        'response_text' => $text,
-                        'is_correct' => $isCorrect,
-                        'awarded_marks' => $awarded,
-                        'marking_method' => 'auto',
+                        'attempt_id'     => $attempt->id,
+                        'question_id'    => $q->id,
+                        'answer_id'      => null,
+                        'response_text'  => $text,
+                        'is_correct'     => null,     // pending
+                        'awarded_marks'  => null,     // pending
+                        'marking_method' => 'manual',
                     ]);
 
                     $detail['items'][] = [
-                        'question_id' => $q->id,
-                        'given_answer' => $text,
-                        'correct_answers' => $canonical,
-                        'is_correct' => $isCorrect,
-                        'status' => $isCorrect ? 'correct' : 'incorrect',
-                        'awarded_marks' => $awarded,
-                    ];
-
-                    if ($isCorrect) {
-                        $scoreCorrectQuestions++;
-                        $detail['correct']++;
-                    } else {
-                        $detail['incorrect']++;
-                    }
-                    $detail['marks_total'] += $awarded;
-                    continue;
-                }
-
-                /**
-                 * MCQ / MULTI-SELECT / TRUE-FALSE
-                 */
-                // Ensure provided ids belong to this question
-                $validIds = $q->answers->pluck('id')->map(fn($x) => (string) $x)->all();
-                $givenIds = array_values(array_filter($givenIds, fn($aid) => in_array($aid, $validIds, true)));
-
-                $correctIds = $q->answers->where('is_correct', true)
-                    ->pluck('id')->map(fn($id) => (string) $id)->values()->toArray();
-
-                $hasGiven = count($givenIds) > 0;
-                $hasKey = count($correctIds) > 0;
-
-                // Nothing selected -> skipped
-                if (!$hasGiven) {
-                    AttemptAnswer::create([
-                        'attempt_id' => $attempt->id,
-                        'question_id' => $q->id,
-                        'answer_id' => null,
-                        'response_text' => null,
-                        'is_correct' => false,
-                        'awarded_marks' => 0,
-                        'marking_method' => 'auto',
-                    ]);
-
-                    $detail['items'][] = [
-                        'question_id' => $q->id,
-                        'given_answer' => null,
-                        'correct_answers' => $correctIds,
-                        'is_correct' => false,
-                        'status' => 'skipped',
-                        'awarded_marks' => 0,
+                        'question_id'     => $q->id,
+                        'given_answer'    => $text,
+                        'correct_answers' => [],
+                        'is_correct'      => false,
+                        'status'          => 'pending',
+                        'awarded_marks'   => 0,
                     ];
                     $detail['skipped']++;
                     continue;
                 }
 
-                // No key configured -> invalid, don't award marks
-                if (!$hasKey) {
+                /* -------- MCQ/TF or SHORT (auto) via Strategy -------- */
+                if (in_array($q->type, ['mcq','tf'])) {
+                    // ensure selected IDs belong to the question
+                    $validIds = $q->answers->pluck('id')->map(fn($x)=>(string)$x)->all();
+                    $givenIds = array_values(array_filter($givenIds, fn($aid)=>in_array($aid, $validIds, true)));
+                }
+
+                // Prepare input to strategy
+                $givenForStrategy = ($q->type === 'short')
+                    ? (is_string($given) ? $given : null)
+                    : $givenIds;
+
+                // Skipped (no selection / empty string)
+                if (($q->type !== 'short' && empty($givenIds)) || ($q->type==='short' && ($givenForStrategy===null || $givenForStrategy===''))) {
+                    AttemptAnswer::create([
+                        'attempt_id'     => $attempt->id,
+                        'question_id'    => $q->id,
+                        'answer_id'      => null,
+                        'response_text'  => $q->type==='short' ? ($givenForStrategy ?? null) : null,
+                        'is_correct'     => false,
+                        'awarded_marks'  => 0,
+                        'marking_method' => 'auto',
+                    ]);
+
                     $detail['items'][] = [
-                        'question_id' => $q->id,
-                        'given_answer' => $givenIds,
-                        'correct_answers' => $correctIds,
-                        'is_correct' => false,
-                        'status' => 'invalid_key',
-                        'awarded_marks' => 0,
+                        'question_id'     => $q->id,
+                        'given_answer'    => $q->type==='short' ? ($givenForStrategy ?? null) : null,
+                        'correct_answers' => $q->type==='short'
+                            ? ($q->answer ?? [])
+                            : $q->answers->where('is_correct',1)->pluck('id')->map(fn($x)=>(string)$x)->values()->toArray(),
+                        'is_correct'      => false,
+                        'status'          => 'skipped',
+                        'awarded_marks'   => 0,
                     ];
-                    $detail['incorrect']++;
+                    $detail['skipped']++;
                     continue;
                 }
 
-                // Create rows per selected answer
-                $rows = [];
-                foreach ($givenIds as $aid) {
-                    $ok = in_array($aid, $correctIds, true);
-                    $rows[] = AttemptAnswer::create([
-                        'attempt_id' => $attempt->id,
-                        'question_id' => $q->id,
-                        'answer_id' => (int) $aid,
-                        'response_text' => null,
-                        'is_correct' => $ok,
-                        'awarded_marks' => 0, // set below
+                // Strategy compute
+                $strategy = $this->pickStrategy($q);
+                $awarded  = (float) $strategy->score($q, $givenForStrategy);
+                $isCorrect = $awarded >= $qMarks;
+
+                // Persist attempt answers
+                if (in_array($q->type, ['mcq','tf'])) {
+                    $rows = [];
+                    $correctIds = $q->answers->where('is_correct',1)->pluck('id')->map(fn($x)=>(string)$x)->all();
+                    foreach ($givenIds as $aid) {
+                        $rows[] = AttemptAnswer::create([
+                            'attempt_id'     => $attempt->id,
+                            'question_id'    => $q->id,
+                            'answer_id'      => (int) $aid,
+                            'response_text'  => null,
+                            'is_correct'     => in_array($aid, $correctIds, true),
+                            'awarded_marks'  => 0,
+                            'marking_method' => 'auto',
+                        ]);
+                    }
+                    if (!empty($rows)) {
+                        $first = $rows[0];
+                        $first->awarded_marks = $awarded;
+                        $first->save();
+                    }
+                } else { // short auto
+                    AttemptAnswer::create([
+                        'attempt_id'     => $attempt->id,
+                        'question_id'    => $q->id,
+                        'answer_id'      => null,
+                        'response_text'  => (string)$givenForStrategy,
+                        'is_correct'     => $isCorrect,
+                        'awarded_marks'  => $awarded,
                         'marking_method' => 'auto',
                     ]);
                 }
 
-                // Exact match by set equality (now both non-empty)
-                $givenSorted = $givenIds;
-                sort($givenSorted);
-                $correctSorted = $correctIds;
-                sort($correctSorted);
-                $isCorrect = ($givenSorted === $correctSorted);
-
-                // Partial scoring support
-                if (($q->scoring ?? 'exact') === 'partial') {
-                    $intersection = count(array_intersect($givenIds, $correctIds));
-                    $awarded = $intersection > 0
-                        ? ($intersection / count($correctIds)) * $qMarks
-                        : 0.0;
-                } else {
-                    $awarded = $isCorrect ? $qMarks : 0.0;
-                }
-
-                if (!empty($rows)) {
-                    $first = $rows[0];
-                    $first->awarded_marks = $awarded;
-                    $first->save();
-                }
+                // Detail row
+                $correctIds = in_array($q->type,['mcq','tf'])
+                    ? $q->answers->where('is_correct',1)->pluck('id')->map(fn($x)=>(string)$x)->values()->toArray()
+                    : ($q->answer ?? []);
 
                 $detail['items'][] = [
-                    'question_id' => $q->id,
-                    'given_answer' => $givenIds,
+                    'question_id'     => $q->id,
+                    'given_answer'    => $q->type==='short' ? (string)$givenForStrategy : $givenIds,
                     'correct_answers' => $correctIds,
-                    'is_correct' => $isCorrect,
-                    'status' => $isCorrect ? 'correct' : 'incorrect',
-                    'awarded_marks' => $awarded,
+                    'is_correct'      => $isCorrect,
+                    'status'          => $isCorrect ? 'correct' : 'incorrect',
+                    'awarded_marks'   => $awarded,
                 ];
 
-                if ($isCorrect) {
-                    $scoreCorrectQuestions++;
-                    $detail['correct']++;
-                } else {
-                    $detail['incorrect']++;
-                }
                 $detail['marks_total'] += $awarded;
+                if ($isCorrect) { $scoreCorrect++; $detail['correct']++; } else { $detail['incorrect']++; }
             }
 
-            // Persist attempt summary
-            $attempt->score = $scoreCorrectQuestions; // number of correct questions
-            $attempt->detail = $detail;
+            // Persist attempt summary (marks-based)
+            $attempt->score = $detail['marks_total'];                           // score == marks
+            $attempt->detail = $detail + ['correct_count' => $scoreCorrect];    // analytics
             $attempt->completed_at = now();
             $attempt->save();
         });
@@ -351,6 +321,10 @@ class AttemptApiController extends Controller
         ]);
     }
 
+    /**
+     * Teacher marks short answers
+     * PATCH /api/v1/attempts/{attempt}/mark
+     */
     public function markShort(Request $request, QuizAttempt $attempt)
     {
         $user = $request->user();
@@ -381,7 +355,7 @@ class AttemptApiController extends Controller
 
                 $maxMarks = (float) ($q->marks ?? 1.0);
                 $awarded = max(0.0, min($maxMarks, (float) $m['score']));
-                $isCorrect = ($awarded >= $maxMarks); // define your threshold; here: full marks => correct
+                $isCorrect = ($awarded >= $maxMarks); // threshold: full marks => correct
 
                 // Update the pending AttemptAnswer row for this short question
                 $aa = AttemptAnswer::where('attempt_id', $attempt->id)
@@ -393,12 +367,11 @@ class AttemptApiController extends Controller
                 if ($aa) {
                     $aa->is_correct = $isCorrect ? 1 : 0;
                     $aa->awarded_marks = $awarded;
-                    // (optional) store comment if you have a column; otherwise skip
                     $aa->save();
                 }
             }
 
-            // Recompute attempt summary from DB (safer than trying to patch in place)
+            // Recompute attempt summary from DB
             $attempt->load(['quiz.questions.answers', 'attemptAnswers']);
             $questions = $attempt->quiz->questions;
 
@@ -426,19 +399,15 @@ class AttemptApiController extends Controller
                     $detail['items'][] = [
                         'question_id' => $q->id,
                         'given_answer' => $aa?->response_text,
-                        'correct_answers' => [],             // manual — no canonical list in detail
+                        'correct_answers' => [],
                         'is_correct' => $isCorrect,
                         'status' => $aa ? ($isCorrect ? 'correct' : 'incorrect') : 'pending',
                         'awarded_marks' => $awarded,
                     ];
 
                     if ($aa) {
-                        if ($isCorrect) {
-                            $scoreCorrect++;
-                            $detail['correct']++;
-                        } else {
-                            $detail['incorrect']++;
-                        }
+                        if ($isCorrect) { $scoreCorrect++; $detail['correct']++; }
+                        else { $detail['incorrect']++; }
                         $detail['marks_total'] += $awarded;
                     } else {
                         $detail['skipped']++;
@@ -446,16 +415,14 @@ class AttemptApiController extends Controller
                     continue;
                 }
 
-                // MCQ/TF: reuse the rows produced during finish()
+                // MCQ/TF
                 $rows = $attempt->attemptAnswers->where('question_id', $q->id);
                 $awarded = (float) ($rows->sortBy('id')->first()->awarded_marks ?? 0.0);
-                $correctIds = $q->answers->where('is_correct', true)->pluck('id')->map(fn($x) => (string) $x)->values()->toArray();
-                $givenIds = $rows->whereNotNull('answer_id')->pluck('answer_id')->map(fn($x) => (string) $x)->values()->toArray();
+                $correctIds = $q->answers->where('is_correct', true)->pluck('id')->map(fn($x) => (string)$x)->values()->toArray();
+                $givenIds = $rows->whereNotNull('answer_id')->pluck('answer_id')->map(fn($x) => (string)$x)->values()->toArray();
 
-                $givenSorted = $givenIds;
-                sort($givenSorted);
-                $correctSorted = $correctIds;
-                sort($correctSorted);
+                $givenSorted = $givenIds; sort($givenSorted);
+                $correctSorted = $correctIds; sort($correctSorted);
                 $isCorrect = (!empty($givenSorted) && !empty($correctSorted) && $givenSorted === $correctSorted);
 
                 $detail['items'][] = [
@@ -467,19 +434,25 @@ class AttemptApiController extends Controller
                     'awarded_marks' => $awarded,
                 ];
 
-                if (empty($givenIds)) {
-                    $detail['skipped']++;
-                } elseif ($isCorrect) {
-                    $scoreCorrect++;
-                    $detail['correct']++;
-                } else {
-                    $detail['incorrect']++;
+                if (empty($givenIds)) { $detail['skipped']++; }
+                else {
+                    if ($isCorrect) { $scoreCorrect++; $detail['correct']++; }
+                    else { $detail['incorrect']++; }
                 }
                 $detail['marks_total'] += $awarded;
             }
 
-            $attempt->score = $scoreCorrect;
-            $attempt->detail = $detail;
+            $attempt->score = $detail['marks_total'];
+            $attempt->detail = $detail + ['correct_count' => $scoreCorrect];
+
+            // graded_at if no pending manuals left
+            $pending = AttemptAnswer::where('attempt_id', $attempt->id)
+                ->where('marking_method', 'manual')
+                ->whereNull('is_correct')->exists();
+            if (!$pending) {
+                $attempt->graded_at = now();
+            }
+
             $attempt->save();
         });
 
@@ -488,5 +461,4 @@ class AttemptApiController extends Controller
             'attempt' => $attempt->fresh()->load(['attemptAnswers.question', 'attemptAnswers.answer']),
         ]);
     }
-
 }

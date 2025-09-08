@@ -12,7 +12,7 @@ class AttemptAnswer extends Model
 
     protected $casts = [
         'is_correct' => 'boolean',
-        'awarded_marks' => 'float',
+        'awarded_marks' => 'decimal:2',
     ];
 
     public function attempt()  { return $this->belongsTo(QuizAttempt::class, 'attempt_id'); }

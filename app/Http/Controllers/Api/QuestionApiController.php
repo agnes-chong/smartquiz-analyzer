@@ -1,13 +1,16 @@
 <?php
-//Author: Chong Pei Lee
+// Author: Chong Pei Lee
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Quiz;
-use App\Models\Question;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\DB;
+
+use App\Models\Quiz;
+use App\Models\Question;
+use App\Models\Answer;
 
 class QuestionApiController extends Controller
 {
@@ -40,10 +43,8 @@ class QuestionApiController extends Controller
             'multiple_choice' => 'mcq',
             'checkbox'        => 'mcq',
             'mcq'             => 'mcq',
-
             'true_false'      => 'tf',
             'tf'              => 'tf',
-
             'short_answer'    => 'short',
             'short'           => 'short',
         ];
@@ -64,39 +65,50 @@ class QuestionApiController extends Controller
     }
 
     /* ===========================
-     | Index
-     | GET /api/quizzes/{quiz}/questions
+     | Index: GET /api/v1/quizzes/{quiz}/questions
+     | Hide answers for students/guests
      ============================*/
-    public function index(Quiz $quiz)
-    {
-        $rows = $quiz->questions()
-            ->select('id','quiz_id','type','text','marks','scoring','penalty','data','answer','created_at','updated_at')
-            ->latest('id')
-            ->get();
+public function index(Quiz $quiz)
+{
+    // Eager load answers (only the fields we need)
+    $rows = $quiz->questions()
+        ->with(['answers:id,question_id,text,is_correct'])
+        ->select('id','quiz_id','type','text','marks','scoring','penalty','data','answer','created_at','updated_at')
+        ->latest('id')
+        ->get();
 
-        // reshape a little for convenience
-        $data = $rows->map(function ($q) {
-            return [
-                'id'        => $q->id,
-                'quiz_id'   => $q->quiz_id,
-                'type'      => $q->type,
-                'prompt'    => $q->data['prompt'] ?? $q->text,
-                'options'   => $q->data['options'] ?? null,
-                'marks'     => $q->marks,
-                'scoring'   => $q->scoring,
-                'penalty'   => $q->penalty,
-                'answer'    => $q->answer,
-                'created_at'=> $q->created_at,
-                'updated_at'=> $q->updated_at,
-            ];
-        });
+    $user = request()->user();
+    $isTeacher = $user && ($user->tokenCan('teacher') || $user->tokenCan('admin'));
 
-        return $this->ok($data, 'Questions fetched');
-    }
+    $data = $rows->map(function ($q) use ($isTeacher) {
+        // build options from answers table so students get option IDs
+        $opts = $q->answers->map(function ($a) use ($isTeacher) {
+            return $isTeacher
+                ? ['id' => $a->id, 'text' => $a->text, 'is_correct' => (bool)$a->is_correct] // teacher sees flags
+                : ['id' => $a->id, 'text' => $a->text]; // student: no correctness
+        })->values()->all();
+
+        return [
+            'id'        => $q->id,
+            'quiz_id'   => $q->quiz_id,
+            'type'      => $q->type,
+            'prompt'    => $q->data['prompt'] ?? $q->text,
+            'options'   => in_array($q->type, ['mcq','tf']) ? $opts : null, // short has no options
+            'marks'     => $q->marks,
+            'scoring'   => $q->scoring,
+            'penalty'   => $q->penalty,
+            'answer'    => $isTeacher ? $q->answer : null, // hide key from students
+            'created_at'=> $q->created_at,
+            'updated_at'=> $q->updated_at,
+        ];
+    });
+
+    return $this->ok($data, 'Questions fetched');
+}
 
     /* ===========================
-     | Store
-     | POST /api/quizzes/{quiz}/questions
+     | Store: POST /api/v1/quizzes/{quiz}/questions
+     | Sync MCQ/TF options into answers table
      ============================*/
     public function store(Request $request, Quiz $quiz)
     {
@@ -177,19 +189,37 @@ class QuestionApiController extends Controller
         if ($type === 'mcq') {
             $ans = array_values((array)($in['answer']));
             $ans = array_map('intval', $ans);
-            $payload['answer'] = $ans;                   // JSON (array)
-            $payload['correct_answer'] = implode(',', $ans); // "0,2"
+            $payload['answer'] = $ans;                   // JSON (array of indices)
+            $payload['correct_answer'] = implode(',', $ans); // optional legacy mirror
         } elseif ($type === 'tf') {
             $idx = (int)$in['answer'];
             $payload['answer'] = [$idx];
-            $payload['correct_answer'] = (string)$idx;   // "0" or "1"
+            $payload['correct_answer'] = (string)$idx;
         } else { // short
             $txt = (string)$in['answer'];
             $payload['answer'] = [$txt];
             $payload['correct_answer'] = $txt;
         }
 
-        $question = Question::create($payload);
+        $question = null;
+
+        DB::transaction(function () use (&$question, $payload, $type) {
+            $question = Question::create($payload);
+
+            // Sync answers table for MCQ/TF
+            if (in_array($type, ['mcq','tf'])) {
+                $opts = $payload['data']['options'] ?? [];
+                $correctIdx = $type === 'mcq' ? $payload['answer'] : [$payload['answer'][0]];
+                Answer::where('question_id', $question->id)->delete();
+                foreach ($opts as $i => $label) {
+                    Answer::create([
+                        'question_id' => $question->id,
+                        'text'        => $label,
+                        'is_correct'  => in_array($i, $correctIdx, true),
+                    ]);
+                }
+            }
+        });
 
         $out = [
             'id'        => $question->id,
@@ -208,8 +238,8 @@ class QuestionApiController extends Controller
     }
 
     /* ===========================
-     | Update
-     | PATCH /api/questions/{question}
+     | Update: PATCH /api/v1/questions/{question}
+     | Re-sync answers if options/answer changed
      ============================*/
     public function update(Request $request, Question $question)
     {
@@ -317,7 +347,26 @@ class QuestionApiController extends Controller
             }
         }
 
-        $question->update($upd);
+        DB::transaction(function () use ($question, $upd, $type, $data) {
+            $question->update($upd);
+
+            // Re-sync answers for MCQ/TF if options/answer changed
+            if (in_array($type, ['mcq','tf'])) {
+                $opts = $data['options'] ?? ($question->data['options'] ?? []);
+                $correctIdx = $type === 'mcq'
+                    ? ($upd['answer'] ?? $question->answer ?? [])
+                    : [($upd['answer'][0] ?? $question->answer[0] ?? 0)];
+
+                Answer::where('question_id', $question->id)->delete();
+                foreach ($opts as $i => $label) {
+                    Answer::create([
+                        'question_id' => $question->id,
+                        'text'        => $label,
+                        'is_correct'  => in_array($i, $correctIdx, true),
+                    ]);
+                }
+            }
+        });
 
         $out = [
             'id'        => $question->id,
@@ -337,7 +386,7 @@ class QuestionApiController extends Controller
 
     /* ===========================
      | Destroy
-     | DELETE /api/questions/{question}
+     | DELETE /api/v1/questions/{question}
      ============================*/
     public function destroy(Request $request, Question $question)
     {

@@ -14,12 +14,19 @@ class QuizAttempt extends Model
         'student_id',
         'score',
         'detail',
+        'started_at',   
         'completed_at',
+        'graded_at',    
+
     ];
 
     protected $casts = [
-        'detail' => 'array',
+        'detail'       => 'array',
+        'started_at'   => 'datetime',  
         'completed_at' => 'datetime',
+        'graded_at'    => 'datetime',  
+        // optional but nice if score is marks-based:
+        // 'score'      => 'decimal:2',
     ];
 
     public function student()

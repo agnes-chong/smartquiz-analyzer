@@ -12,45 +12,50 @@ class AnswerSeeder extends Seeder
 {
     public function run(): void
     {
-        Question::chunk(200, function ($questions) {
+        Question::with('answers')->chunk(200, function ($questions) {
             foreach ($questions as $q) {
-                $data = $q->data;
-                if (is_string($data)) {
-                    $data = json_decode($data, true) ?: [];
-                }
+                $data = is_array($q->data) ? $q->data : (json_decode((string)$q->data, true) ?: []);
                 $options = Arr::get($data, 'options');
 
-                // short → no options, ensure none dangling
+                // Short: ensure no dangling options
                 if (($q->type ?? '') === 'short') {
                     Answer::where('question_id', $q->id)->delete();
                     continue;
                 }
 
-                // tf fallback
-                if (($q->type ?? '') === 'tf' && empty($options)) {
-                    $options = ['False', 'True'];
-                }
                 if (!is_array($options) || !count($options)) {
-                    Answer::where('question_id', $q->id)->delete();
+                    // No options known -> do NOT overwrite existing correctness
+                    // (just skip; leave existing answers as-is)
                     continue;
                 }
 
+                // Correct indices from question->answer or correct_answer
                 $correctIdx = $this->resolveCorrectIndices($q);
 
                 DB::transaction(function () use ($q, $options, $correctIdx) {
-                    // Upsert each option by (question_id, text)
                     $keptTexts = [];
                     foreach ($options as $i => $label) {
                         $text = is_scalar($label) ? (string)$label : json_encode($label);
                         $keptTexts[] = $text;
 
-                        Answer::updateOrCreate(
-                            ['question_id' => $q->id, 'text' => $text],
-                            ['is_correct'  => in_array((int)$i, $correctIdx, true)]
-                        );
+                        // Upsert by (question_id,text). Only set is_correct if we know the key.
+                        $attrs = ['question_id' => $q->id, 'text' => $text];
+                        $vals  = [];
+                        if (!empty($correctIdx)) {
+                            $vals['is_correct'] = in_array((int)$i, $correctIdx, true);
+                        }
+                        $row = Answer::updateOrCreate($attrs, $vals);
+
+                        // If we didn't know the key and row didn't exist, default false
+                        if (empty($correctIdx) && !$row->wasRecentlyCreated) {
+                            // keep existing is_correct as-is
+                        } elseif (empty($correctIdx) && $row->wasRecentlyCreated) {
+                            $row->is_correct = false;
+                            $row->save();
+                        }
                     }
 
-                    // Delete stale rows (texts no longer present)
+                    // Remove stale rows (texts no longer present)
                     Answer::where('question_id', $q->id)
                           ->whereNotIn('text', $keptTexts)
                           ->delete();
@@ -75,7 +80,7 @@ class AnswerSeeder extends Seeder
                 array_filter(array_map('trim', explode(',', $ca)), fn($s) => $s !== '')
             );
         }
-        return [];
+        return []; // unknown -> do not override existing flags
     }
 
     private function allNumeric(array $arr): bool
